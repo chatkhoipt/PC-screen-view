@@ -20,9 +20,12 @@ class ScreenServer(QWidget):
         self.init_ui()
         self.show()
 
+        # Thread to handle new connections
         self.accept_thread = threading.Thread(target=self.accept_connections)
+        self.accept_thread.daemon = True
         self.accept_thread.start()
 
+    # Initialize UI layout
     def init_ui(self):
         self.layout = QVBoxLayout()
         self.label = QLabel()
@@ -30,35 +33,61 @@ class ScreenServer(QWidget):
         self.setLayout(self.layout)
         self.setWindowTitle("Client Screen Viewer")
 
+    # Accept connections from clients
     def accept_connections(self):
         while True:
             conn, addr = self.sock.accept()
             print(f"[+] Connection established with {addr}")
-            self.receive_screen_thread = threading.Thread(target=self.receive_screen, args=(conn,))
-            self.receive_screen_thread.start()
+            # Create a thread for each client connection
+            receive_thread = threading.Thread(target=self.receive_screen, args=(conn,))
+            receive_thread.daemon = True
+            receive_thread.start()
 
+    # Receive and display the screen from the client
     def receive_screen(self, conn):
-        while True:
-            # Receive the length of the image
-            img_len = int.from_bytes(conn.recv(4), 'big')
-            img_data = b''
+        try:
+            while True:
+                # Receive the length of the image
+                img_len_bytes = conn.recv(4)
+                if not img_len_bytes:
+                    break  # Client has closed the connection
 
-            # Receive the image
-            while len(img_data) < img_len:
-                img_data += conn.recv(img_len - len(img_data))
+                img_len = int.from_bytes(img_len_bytes, 'big')
+                img_data = b''
 
-            # Decode image
-            img_array = np.frombuffer(img_data, np.uint8)
-            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            
-            # Convert to QImage and display
-            qimg = QImage(img, img.shape[1], img.shape[0], img.shape[1] * 3, QImage.Format_RGB888)
-            pixmap = QPixmap.fromImage(qimg)
-            self.label.setPixmap(pixmap)
+                # Receive the image data
+                while len(img_data) < img_len:
+                    packet = conn.recv(img_len - len(img_data))
+                    if not packet:
+                        break  # Connection closed by the client
+                    img_data += packet
+
+                if not img_data:
+                    break  # No image data, client has disconnected
+
+                # Decode image and convert to displayable format
+                img_array = np.frombuffer(img_data, np.uint8)
+                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+                # Convert to QImage and display on QLabel
+                qimg = QImage(img, img.shape[1], img.shape[0], img.shape[1] * 3, QImage.Format_RGB888)
+                pixmap = QPixmap.fromImage(qimg)
+                self.label.setPixmap(pixmap)
+
+        except (ConnectionResetError, BrokenPipeError):
+            pass  # Gracefully handle client disconnection
+        finally:
+            print(f"[-] Client disconnected, clearing screen data...")
+            self.clear_screen()  # Clear the QLabel when client disconnects
+            conn.close()
+
+    # Clear the QLabel (reset the screen display)
+    def clear_screen(self):
+        self.label.clear()  # Clear the QLabel content
 
 if __name__ == '__main__':
-    # Start Qt app for server
+    # Start Qt application for server
     app = QApplication(sys.argv)
     server = ScreenServer()
     sys.exit(app.exec_())
