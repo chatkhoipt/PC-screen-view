@@ -1,93 +1,212 @@
 import sys
 import socket
 import threading
+import tkinter as tk
+from tkinter import ttk
 import numpy as np
 import cv2
-from PyQt5.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
-from PyQt5.QtGui import QImage, QPixmap
 
-# Server to view client's screen
-class ScreenServer(QWidget):
-    def __init__(self, host='0.0.0.0', port=9999):
-        super().__init__()
+class ClientScreenController:
+    """Class for managing individual client controls using Tkinter."""
+    def __init__(self, conn, address, root, disconnect_callback):
+        self.conn = conn
+        self.address = address
+        self.root = root
+        self.disconnect_callback = disconnect_callback
+        self.message_box_active = False
+
+        # Create a frame for this client in the main window
+        self.frame = ttk.Frame(root)
+        self.frame.pack(fill="x", padx=5, pady=5)
+
+        # Add controls
+        ttk.Label(self.frame, text=f"Client: {self.address}").pack(side="left")
+        self.toggle_button = ttk.Button(
+            self.frame, text="Toggle Message Boxes", command=self.toggle_message_boxes
+        )
+        self.toggle_button.pack(side="right")
+
+        # Start screen receiver thread
+        self.receive_thread = threading.Thread(target=self.receive_screen)
+        self.receive_thread.daemon = True
+        self.receive_thread.start()
+
+    def toggle_message_boxes(self):
+        """Send a command to toggle message boxes on the client."""
+        self.message_box_active = not self.message_box_active
+        command = b"START_MESSAGE" if self.message_box_active else b"STOP_MESSAGE"
+        try:
+            self.conn.send(command)
+        except Exception as e:
+            print(f"[!] Error sending command to {self.address}: {e}")
+
+    def receive_screen(self):
+        """Receives the screen data and displays it dynamically resizable using OpenCV."""
+        try:
+            window_name = f"Client Screen - {self.address}"
+
+            while True:
+                # Check if the window needs to be recreated
+                if not cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) >= 1:
+                    # Recreate the resizable window
+                    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                    cv2.resizeWindow(window_name, 640, 480)  # Reset to default size
+
+                img_len_bytes = self.conn.recv(4)
+                if not img_len_bytes:
+                    break
+
+                img_len = int.from_bytes(img_len_bytes, 'big')
+                img_data = b""
+
+                while len(img_data) < img_len:
+                    packet = self.conn.recv(img_len - len(img_data))
+                    if not packet:
+                        break
+                    img_data += packet
+
+                if not img_data:
+                    break
+
+                # Decode the image
+                img_array = np.frombuffer(img_data, np.uint8)
+                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                if img is not None:
+                    # Display the image
+                    cv2.imshow(window_name, img)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        print(f"[-] Closed screen for {self.address}")
+                        break
+
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+            print(f"[!] Connection lost with {self.address}.")
+        finally:
+            self.disconnect_callback(self.conn)
+            cv2.destroyWindow(window_name)
+
+    def stop(self):
+        """Stops the screen and cleans up resources."""
+        cv2.destroyWindow(f"Client Screen - {self.address}")
+        self.conn.close()
+        self.frame.destroy()
+
+
+class ServerController:
+    """Main server controller to manage clients."""
+    def __init__(self, root, host="0.0.0.0", port=9999, max_clients=10):
+        self.root = root
         self.host = host
         self.port = port
+        self.max_clients = max_clients
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.bind((self.host, self.port))
-        self.sock.listen(5)
+        self.sock.listen(max_clients)
         print(f"[*] Listening on {self.host}:{self.port}")
-        
-        self.init_ui()
-        self.show()
 
-        # Thread to handle new connections
+        # Dictionary to keep track of connected clients
+        self.client_controllers = {}
+
+        # Start a thread to accept new connections
         self.accept_thread = threading.Thread(target=self.accept_connections)
         self.accept_thread.daemon = True
         self.accept_thread.start()
 
-    # Initialize UI layout
-    def init_ui(self):
-        self.layout = QVBoxLayout()
-        self.label = QLabel()
-        self.layout.addWidget(self.label)
-        self.setLayout(self.layout)
-        self.setWindowTitle("Client Screen Viewer")
-
-    # Accept connections from clients
     def accept_connections(self):
+        """Accepts new client connections."""
         while True:
-            conn, addr = self.sock.accept()
-            print(f"[+] Connection established with {addr}")
-            # Create a thread for each client connection
-            receive_thread = threading.Thread(target=self.receive_screen, args=(conn,))
-            receive_thread.daemon = True
-            receive_thread.start()
+            if len(self.client_controllers) < self.max_clients:
+                try:
+                    conn, addr = self.sock.accept()
+                    print(f"[+] Connection established with {addr}")
 
-    # Receive and display the screen from the client
-    def receive_screen(self, conn):
-        try:
-            while True:
-                # Receive the length of the image
-                img_len_bytes = conn.recv(4)
-                if not img_len_bytes:
-                    break  # Client has closed the connection
+                    # Create a new client controller
+                    controller = ClientScreenController(
+                        conn, addr, self.root, self.remove_client
+                    )
+                    self.client_controllers[conn] = controller
+                except Exception as e:
+                    print(f"[!] Error accepting connection: {e}")
 
-                img_len = int.from_bytes(img_len_bytes, 'big')
-                img_data = b''
+    def remove_client(self, conn):
+        """Removes a client when it disconnects."""
+        if conn in self.client_controllers:
+            self.client_controllers[conn].stop()
+            del self.client_controllers[conn]
+            print(f"[-] Client disconnected and removed.")
 
-                # Receive the image data
-                while len(img_data) < img_len:
-                    packet = conn.recv(img_len - len(img_data))
-                    if not packet:
-                        break  # Connection closed by the client
-                    img_data += packet
+    def stop_server(self):
+        """Stops the server and cleans up all resources."""
+        print("[*] Stopping server...")
+        for conn in list(self.client_controllers.keys()):
+            self.remove_client(conn)
+        self.sock.close()
+        print("[*] Server stopped.")
 
-                if not img_data:
-                    break  # No image data, client has disconnected
+class ServerController:
+    """Main server controller to manage clients."""
+    def __init__(self, root, host="0.0.0.0", port=9999, max_clients=10):
+        self.root = root
+        self.host = host
+        self.port = port
+        self.max_clients = max_clients
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind((self.host, self.port))
+        self.sock.listen(max_clients)
+        print(f"[*] Listening on {self.host}:{self.port}")
 
-                # Decode image and convert to displayable format
-                img_array = np.frombuffer(img_data, np.uint8)
-                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        # Dictionary to keep track of connected clients
+        self.client_controllers = {}
 
-                # Convert to QImage and display on QLabel
-                qimg = QImage(img, img.shape[1], img.shape[0], img.shape[1] * 3, QImage.Format_RGB888)
-                pixmap = QPixmap.fromImage(qimg)
-                self.label.setPixmap(pixmap)
+        # Start a thread to accept new connections
+        self.accept_thread = threading.Thread(target=self.accept_connections)
+        self.accept_thread.daemon = True
+        self.accept_thread.start()
 
-        except (ConnectionResetError, BrokenPipeError):
-            pass  # Gracefully handle client disconnection
-        finally:
-            print(f"[-] Client disconnected, clearing screen data...")
-            self.clear_screen()  # Clear the QLabel when client disconnects
-            conn.close()
+    def accept_connections(self):
+        """Accepts new client connections."""
+        while True:
+            if len(self.client_controllers) < self.max_clients:
+                try:
+                    conn, addr = self.sock.accept()
+                    print(f"[+] Connection established with {addr}")
 
-    # Clear the QLabel (reset the screen display)
-    def clear_screen(self):
-        self.label.clear()  # Clear the QLabel content
+                    # Create a new client controller
+                    controller = ClientScreenController(
+                        conn, addr, self.root, self.remove_client
+                    )
+                    self.client_controllers[conn] = controller
+                except Exception as e:
+                    print(f"[!] Error accepting connection: {e}")
 
-if __name__ == '__main__':
-    # Start Qt application for server
-    app = QApplication(sys.argv)
-    server = ScreenServer()
-    sys.exit(app.exec_())
+    def remove_client(self, conn):
+        """Removes a client when it disconnects."""
+        if conn in self.client_controllers:
+            self.client_controllers[conn].stop()
+            del self.client_controllers[conn]
+            print(f"[-] Client disconnected and removed.")
+
+    def stop_server(self):
+        """Stops the server and cleans up all resources."""
+        print("[*] Stopping server...")
+        for conn in list(self.client_controllers.keys()):
+            self.remove_client(conn)
+        self.sock.close()
+        print("[*] Server stopped.")
+
+
+if __name__ == "__main__":
+    try:
+        # Create Tkinter main window
+        root = tk.Tk()
+        root.title("Server Controller")
+
+        # Start the server
+        server = ServerController(root)
+
+        # Run Tkinter main loop
+        root.protocol("WM_DELETE_WINDOW", lambda: (server.stop_server(), root.destroy()))
+        root.mainloop()
+    except KeyboardInterrupt:
+        print("\n[*] Shutting down server...")
+        server.stop_server()
+        sys.exit(0)
